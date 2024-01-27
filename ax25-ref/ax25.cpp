@@ -1,27 +1,76 @@
 #include "ax25.h"
 
-// The constructor defines the callsign from ihich the message will vbe sent
-AX25::AX25(char *source_callsign, byte source_ssid){
-  setFromCallsign(source_callsign);
-  setSSIDsource(source_callsign);
+  // Calls constructor GenericSPIClass encapsulates the standard Arduino hardware and other
+  // hardware SPI interfaces. Defaults to Frequency1MHz, BitOrderMSBFirst, DataMode0.
+  // Calls RH_RF22 constructor with defaults of SS pin and pin 2 for interrupt
+AX25::AX25(uint8_t slaveSelectPin, uint8_t interruptPin, uint8_t _shutdownPin)
+ : spi(RHHardwareSPI()), radio(RH_RF22(slaveSelectPin, interruptPin, spi)) {
+  shutdownPin = _shutdownPin;
 }
 
-void AX25::setDestination(char *dest_callsign, byte dest_ssid){
-  setToCallsign(dest_callsign);
-  setSSIDdest(dest_ssid);
+// Power cycles the radio, then initalizes the radio
+bool AX25::powerAndInit() {
+  // Need a delay before turning on radio
+  // so that power supply can stabilize
+  digitalWrite(shutdownPin, HIGH);
+  delay(2000);
+  digitalWrite(shutdownPin, LOW);
+  delay(500);
+
+  if (!radio.init()) {
+    return false;
+    Serial.println("init failed");
+  } else {
+    return true;
+    Serial.println("init success");
+  }
+
 }
 
-// Formats message and returns byte sequence containing packet
-byte* AX25::modulatePacket(char* message, uint16_t size) {
+
+// Formats and transmit messages and then puts radio to sleep
+void AX25::transmit(char* message1, uint16_t size) {
   Index = 0;
   arrayInit();
+  setCallsignAndSsid();
+  // Serial.println(message);
+  // strcpy(message, message1);
 
-  // Copy message into message buffer
-  memcpy(message_buffer, message, size);
-
+  memcpy(message, message1, size);
+  // Serial.print("messge size: "); Serial.println(sizeof(message));
+  // Serial.print("messge: "); Serial.println(message);
   formatPacket(size);
+  sendPacket();
+  radio.waitPacketSent();
+  radio.sleep();
+}
 
-  return finalSequence;
+bool AX25::available() {
+  return radio.available();
+}
+
+void AX25::setRxMode() {
+  // radio.sleep();
+  radio.setModeRx();
+
+  arrayInit();
+  setCallsignAndSsid();
+  radio.setModeIdle();
+  radio.setFrequency(437.505);  //TODO: FIX
+  radio.setModemRegisters(&FSK1k2);
+}
+
+void AX25::setTxMode() {
+  radio.setModeTx();
+}
+
+void AX25::sendPacket() {
+  radio.setModeIdle();
+  radio.setFrequency(437.505);  //TODO: FIX
+  radio.setModemRegisters(&FSK1k2);
+  radio.setTxPower(RH_RF22_RF23BP_TXPOW_29DBM); //TODO FIX
+  // radio.setTxPower(0x02); //TODO FIX
+  radio.send(finalSequence, Index);  
 }
 
 bool AX25::receive(uint8_t* buf, uint8_t* len) {
@@ -63,13 +112,15 @@ void AX25::formatPacket(uint16_t size) {
   addHeader(bitSequence);
 
   //Add Message
-  for (int i=0; i < size ; i++) bitSequence[Index++] = message_buffer[i];
+  for (int i=0; i < size ; i++) bitSequence[Index++] = message[i];
 
-  //Convert bit sequence from MSB (Most Significant Bit Fist) to LSB (Least Significant Bit Fist) 
+  //Convert bit sequence from MSB to LSB
   for (int i=0; i < Index ; i++) bitSequence[i] = MSB_LSB_swap_8bit(bitSequence[i]);
 
   //Compute Frame check sequence : CRC
   FCS = crcCcitt(bitSequence, Index);
+
+  // Serial.print("CRC:"); Serial.println(FCS, HEX);
   
   //Add FCS in MSB form
   //Add MS byte
@@ -77,9 +128,20 @@ void AX25::formatPacket(uint16_t size) {
   //Add LS byte
   bitSequence[Index++] = FCS & 0xff;
 
+    
+  // radio.printBuffer("Init Message:", bitSequence, Index);
+
+    
   //Bit Processing...Bit stuff, add FLAG and do NRZI enconding...
   bitProcessing(bitSequence,Index);
+
+  // Serial.println("mesg; ");
+  // for (int i=0; i< MAX_LENGTH_FINAL ;i++) Serial.println(finalSequence[i]);
+  // Serial.println("");
+  
 }
+
+
 
 void AX25::bitProcessing(byte *Buffer, uint8_t bytelength) {
   
@@ -410,6 +472,27 @@ boolean AX25::logicXOR(boolean a, boolean b) {
   return (a||b) && !(a && b); 
 }
 
+// unsigned int AX25::crcCcitt (byte *Buffer, uint8_t bytelength) {
+//   uint8_t OutBit = 0;
+//   unsigned int XORMask = 0x0000;
+//   unsigned int SR = 0xFFFF;
+  
+//   for (int i=0; i<bytelength ; i++)
+//   {
+//     for (uint8_t b = 128 ; b > 0 ; b = b/2) {
+       
+//       OutBit = SR & 1 ? 1 : 0; //Bit shifted out of shift register
+    
+//       SR = SR>>1; // Shift the register to the right and shift a zero in
+
+//       XORMask = logicXOR((Buffer[i] & b),OutBit) ? MSB_LSB_swap_16bit(CRC_POLYGEN) : 0x0000;
+
+//       SR = SR ^ XORMask;
+//     }
+//   }
+//   return  MSB_LSB_swap_16bit(~SR);  
+// }
+
 uint16_t AX25::crcCcitt (byte *Buffer, uint8_t bytelength) {
   uint8_t OutBit = 0;
   uint16_t XORMask = 0x0000;
@@ -441,6 +524,18 @@ byte AX25::MSB_LSB_swap_8bit(byte v) {
   return v;
 }
 
+// unsigned int AX25::MSB_LSB_swap_16bit(unsigned int v) {
+//   // swap odd and even bits
+//   v = ((v >> 1) & 0x5555) | ((v & 0x5555) << 1);
+//   // swap consecutive pairs
+//   v = ((v >> 2) & 0x3333) | ((v & 0x3333) << 2);
+//   // swap nibbles ... 
+//   v = ((v >> 4) & 0x0F0F) | ((v & 0x0F0F) << 4);
+//   // swap bytes
+//   v = ((v >> 8) & 0x00FF) | ((v & 0x00FF) << 8);  
+//   return v;
+// }
+
 uint16_t AX25::MSB_LSB_swap_16bit(uint16_t v) {
   // swap odd and even bits
   v = ((v >> 1) & 0x5555) | ((v & 0x5555) << 1);
@@ -454,8 +549,18 @@ uint16_t AX25::MSB_LSB_swap_16bit(uint16_t v) {
 }
 
 void AX25::arrayInit() {
-  // Populate arrays for message and final sequence with 0s
   for (int i=0; i< MAX_LENGTH * 8 ;i++) bitSequence[i] = 0;
   for (int i=0; i< MAX_LENGTH_FINAL ;i++) finalSequence[i] = 0;
   for (int j=0; j< 256 ;j++) strcpy(message," ");
 }
+
+void AX25::setCallsignAndSsid() {
+  setFromCallsign("KD2BHC"); //TODO replace
+  setToCallsign("CQ    ");
+  setSSIDdest(AX25_SSID_DESTINATION);
+  setSSIDsource(AX25_SSID_SOURCE);
+}
+
+
+
+

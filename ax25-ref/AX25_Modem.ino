@@ -1,43 +1,212 @@
-#include "ax25.h"
+#include <SPI.h>
+#include <RH_RF22.h>
+#include <RHGenericDriver.h>>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+///                  Teensy      RFM-22B
+///                  GND----------GND-\ (ground in)
+///                               SDN-/ (shutdown in)
+///                  3V3----------VCC   (3.3V in)
+///  interrupt 2 pin D2-----------NIRQ  (interrupt request out)
+///           SS pin D10----------NSEL  (chip select in)
+///          SCK pin D13----------SCK   (SPI clock in)
+///         MOSI pin D11----------SDI   (SPI Data in)
+///         MISO pin D12----------SDO   (SPI data out)
+///                            /--GPIO0 (GPIO0 out to control transmitter antenna TX_ANT)
+///                            \--TX_ANT (TX antenna control in) RFM22B only
+///                            /--GPIO1 (GPIO1 out to control receiver antenna RX_ANT)
+///                            \--RX_ANT (RX antenna control in) RFM22B only
+/// For an Arduino Mega:
+/// \code
+///                 Mega         RFM-22B
+///                 GND----------GND-\ (ground in)
+///                              SDN-/ (shutdown in)
+///                 3V3----------VCC   (3.3V in)
+/// interrupt 0 pin D2-----------NIRQ  (interrupt request out)
+///          SS pin D53----------NSEL  (chip select in)
+///         SCK pin D52----------SCK   (SPI clock in)
+///        MOSI pin D51----------SDI   (SPI Data in)
+///        MISO pin D50----------SDO   (SPI data out)
+///                           /--GPIO0 (GPIO0 out to control transmitter antenna TX_ANT)
+///                           \--TX_ANT (TX antenna control in) RFM22B only
+///                           /--GPIO1 (GPIO1 out to control receiver antenna RX_ANT)
+///                           \--RX_ANT (RX antenna control in) RFM22B only
+///
+/// For connecting an Arduino to an RFM23BP module. Note that the antenna control pins are reversed 
+/// compared to the RF22.
+/// \code
+///                 Arduino      RFM-23BP
+///                 GND----------GND-\ (ground in)
+///                              SDN-/ (shutdown in)
+///                 5V-----------VCC   (5V in)
+/// interrupt 0 pin D2-----------NIRQ  (interrupt request out)
+///          SS pin D10----------NSEL  (chip select in)
+///         SCK pin D13----------SCK   (SPI clock in)
+///        MOSI pin D11----------SDI   (SPI Data in)
+///        MISO pin D12----------SDO   (SPI data out)
+///                           /--GPIO0 (GPIO0 out to control receiver antenna RXON)
+///                           \--RXON   (RX antenna control in)
+///                           /--GPIO1 (GPIO1 out to control transmitter antenna TXON)
+///                           \--TXON   (TX antenna control in)
 
-// The constructor defines the callsign from ihich the message will vbe sent
-AX25::AX25(char *source_callsign, byte source_ssid){
-  setFromCallsign(source_callsign);
-  setSSIDsource(source_callsign);
+#define FLAG 0x7E
+//Protocol Identifier. 0xF0 means : No Layer 3 protocol implemented
+#define PID 0xF0
+//Control Field Type for Unnumbered Information Frames : 0x03
+#define CONTROL 0x03
+#define MAX_LENGTH 280
+#define MAX_LENGTH_FINAL 450
+//CRC-CCITT
+#define CRC_POLYGEN     0x1021
+
+char SrcCallsign[7] = "000000";
+char DestCallsign[7] = "000000";
+
+byte ssid_source = 0;
+byte ssid_destination = 0;
+
+byte bitSequence[280*8];
+byte finalSequence[450];
+byte RcvSequence[450];
+uint8_t len = sizeof(RcvSequence);
+char message[256];
+
+int Index = 0;
+
+// CRC-CCITT
+unsigned int FCS = 0;
+
+#define RADIO_SS       10
+#define RADIO_INT       2
+#define RADIO_SDN       9
+#define TEENSY_LED     13
+
+RHHardwareSPI spi;
+RH_RF22 radio = RH_RF22(RADIO_SS, RADIO_INT, spi);
+
+RH_RF22::ModemConfig FSK1k2 = {
+  0x2B, //reg_1c
+  0x03, //reg_1f
+  0x41, //reg_20
+  0x60, //reg_21
+  0x27, //reg_22
+  0x52, //reg_23
+  0x00, //reg_24
+  0x9F, //reg_25
+  0x2C, //reg_2c - Only matters for OOK mode
+  0x11, //reg_2d - Only matters for OOK mode
+  0x2A, //reg_2e - Only matters for OOK mode
+  0x80, //reg_58
+  0x60, //reg_69
+  0x09, //reg_6e
+  0xD5, //reg_6f
+  0x24, //reg_70
+  0x22, //reg_71
+  0x01  //reg_72
+};
+
+inline void setSSIDsource(byte ssid_src) { ssid_source = ssid_src;}
+inline void setSSIDdest(byte ssid_dest) { ssid_destination = ssid_dest;}
+inline void setFromCallsign(char *fromcallsign){strcpy(SrcCallsign,fromcallsign);}
+inline void setToCallsign(char *tocallsign){strcpy(DestCallsign,tocallsign);}
+
+void AddHeader(byte *Buffer);
+void BitProcessing(byte *Buffer,uint8_t bytelength);
+void Demod(byte *Buffer,uint8_t bytelength);
+
+//CRC_CCITT
+unsigned int CRC_CCITT (byte *Buffer,uint8_t bytelength);
+boolean logicXOR(boolean a, boolean b);
+unsigned int MSB_LSB_swap_16bit(unsigned int v);
+byte MSB_LSB_swap_8bit(byte v);
+
+void setup() 
+{ 
+  Serial.begin(9600);
+  pinMode(TEENSY_LED, OUTPUT);
+  pinMode(RADIO_SDN, OUTPUT);
+  digitalWrite(RADIO_SDN, LOW);
+  //Only init once...since Interrupt flag will increment
+  if (!radio.init()) Serial.println("init failed");
+  delay(3000);
 }
 
-void AX25::setDestination(char *dest_callsign, byte dest_ssid){
-  setToCallsign(dest_callsign);
-  setSSIDdest(dest_ssid);
-}
-
-// Formats message and returns byte sequence containing packet
-byte* AX25::modulatePacket(char* message, uint16_t size) {
+void loop()
+{  
   Index = 0;
-  arrayInit();
+  
+  //Array Initialization
+  for (int i=0; i< MAX_LENGTH * 8 ;i++) bitSequence[i] = 0;
+  for (int i=0; i< MAX_LENGTH_FINAL ;i++) finalSequence[i] = 0;
+  for (int i=0; i< MAX_LENGTH_FINAL ;i++) RcvSequence[i] = 0;
+  for (int j=0; j< 256 ;j++) strcpy(message," ");
+  
+  //Set CallSign and SSID
+  setFromCallsign("KD2BHC");
+  setToCallsign("CQ    ");
+  setSSIDdest(0x60);
+  setSSIDsource(0x61);
 
-  // Copy message into message buffer
-  memcpy(message_buffer, message, size);
+  //MESSAGE to transmit
+  strcpy(message,"Test!!!");  
+  
+  //----------------------- Start Ax25 Packet format ----------------------//
+  
+  //Add Header
+  AddHeader(bitSequence);
+      
+  //Add Message
+  for (int i=0; i < strlen(message) ; i++) bitSequence[Index++] = message[i];
+     
+  //Convert bit sequence from MSB to LSB
+  for (int i=0; i < Index ; i++) bitSequence[i] = MSB_LSB_swap_8bit(bitSequence[i]);
+    
+  //Compute Frame check sequence : CRC
+  FCS = CRC_CCITT(bitSequence, Index);
+  
+  //Add FCS in MSB form
+  //Add MS byte
+  bitSequence[Index++] = (FCS >> 8) & 0xff;
+  //Add LS byte
+  bitSequence[Index++] = FCS & 0xff;
+    
+  //radio.printBuffer("Init Message:", bitSequence, Index);
+    
+  //Bit Processing...Bit stuff, add FLAG and do NRZI enconding...
+  BitProcessing(bitSequence,Index);
+  
+   //----------------------- End Ax25 Packet format ----------------------//
+  radio.setModeIdle();
+  radio.setFrequency(437.505);
+  radio.setModemRegisters(&FSK1k2);
+  radio.setTxPower(RH_RF22_RF23BP_TXPOW_30DBM); 
+  radio.send(finalSequence, Index); 
+  radio.waitPacketSent();
 
-  formatPacket(size);
-
-  return finalSequence;
+  radio.sleep();
+  delay(5000);
+  
+  if (radio.waitAvailableTimeout(5000))
+  { 
+    // Should be a reply message for us now   
+    if (radio.recv(RcvSequence, &len))
+    {
+      Serial.println("got reply: ");
+      for (int i=0 ; i < len; i++) Serial.print(RcvSequence[i]);
+      Demod(RcvSequence,450);
+    }
+    else Serial.println("recv failed");
+  }
+  else Serial.println("No reply...");
+  
+  delay(2000);
+  
 }
 
-bool AX25::receive(uint8_t* buf, uint8_t* len) {
-  *len = MAX_LENGTH_FINAL;
-  return radio.recv(buf, len);
-}
+void AddHeader(byte *Buffer)
+{
 
-void AX25::setSSIDsource(byte ssid_src) { ssid_source = ssid_src;}
-void AX25::setSSIDdest(byte ssid_dest) { ssid_destination = ssid_dest;}
-void AX25::setFromCallsign(char *fromcallsign){strcpy(SrcCallsign,fromcallsign);}
-void AX25::setToCallsign(char *tocallsign){strcpy(DestCallsign,tocallsign);}
-
-// void setFrequency(float freq) {radio.setFrequency(freq);}
-// void setPower(byte pwr) {radio.setTxPower(pwr);}
-
-void AX25::addHeader(byte *Buffer) {
     //Shift bits 1 place to the left in order to allow for HDLC extension bit
     for (int i=0; i < strlen(DestCallsign) ; i++) Buffer[Index++] = DestCallsign[i]<<1;
 
@@ -51,37 +220,14 @@ void AX25::addHeader(byte *Buffer) {
     Buffer[Index++] = ssid_source;
    
     //Append Control bits
-    Buffer[Index++] = AX25_CONTROL;
+    Buffer[Index++] = CONTROL;
     
     //Append Protocol Identifier
-    Buffer[Index++] = AX25_PROTOCOL;
+    Buffer[Index++] = PID;
 }
 
-void AX25::formatPacket(uint16_t size) {
-  
-  // Add Header
-  addHeader(bitSequence);
-
-  //Add Message
-  for (int i=0; i < size ; i++) bitSequence[Index++] = message_buffer[i];
-
-  //Convert bit sequence from MSB (Most Significant Bit Fist) to LSB (Least Significant Bit Fist) 
-  for (int i=0; i < Index ; i++) bitSequence[i] = MSB_LSB_swap_8bit(bitSequence[i]);
-
-  //Compute Frame check sequence : CRC
-  FCS = crcCcitt(bitSequence, Index);
-  
-  //Add FCS in MSB form
-  //Add MS byte
-  bitSequence[Index++] = (FCS >> 8) & 0xff;
-  //Add LS byte
-  bitSequence[Index++] = FCS & 0xff;
-
-  //Bit Processing...Bit stuff, add FLAG and do NRZI enconding...
-  bitProcessing(bitSequence,Index);
-}
-
-void AX25::bitProcessing(byte *Buffer, uint8_t bytelength) {
+void BitProcessing(byte *Buffer, uint8_t bytelength)
+{
   
     byte BitSequence[bytelength*8+1];
     byte BitSequenceStuffed[bytelength*8+bytelength*8/5+1];
@@ -115,7 +261,6 @@ void AX25::bitProcessing(byte *Buffer, uint8_t bytelength) {
         {
             BitSequenceStuffed[s++] = 0x00; // stuff with a zero bit
             cnt = 0; // and reset cnt to zero
-
         }
       }
       
@@ -181,7 +326,8 @@ void AX25::bitProcessing(byte *Buffer, uint8_t bytelength) {
       }
 }
 
-char* AX25::demod(byte *Buffer, uint8_t bytelength) {
+void Demod(byte *Buffer, uint8_t bytelength)
+{
   
     byte BitSequence[bytelength*8];
     byte ByteSequence[bytelength];
@@ -241,17 +387,14 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
         ByteSequence[k++] = temp;
     }
 //Test
-   // radio.printBuffer("NRZI:", ByteSequence, k);
+//    radio.printBuffer("NRZI:", ByteSequence, k);
 
     pastFlag = false;
     cnt = 0;
     //Find and Remove Flags
     for (int i = 0; i < k; i++)
     {
-       Serial.println(ByteSequence[i], HEX);
-
-
-       if (ByteSequence[i] != AX25_FLAG)
+       if (ByteSequence[i] != FLAG)
        {
           pastFlag = true;
           ByteSequence_temp[cnt++] = ByteSequence[i]; 
@@ -259,7 +402,7 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
     }
     
 //Test
-   // radio.printBuffer("Removed Flags:", ByteSequence_temp, cnt);
+//    radio.printBuffer("Removed Flags:", ByteSequence_temp, cnt);
     
     //Re-init
     for (int i=0; i < bytelength*8 ; i++) BitSequence[i] = 0x00;
@@ -277,19 +420,6 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
    //Re-init
    for (int i=0; i < bytelength*8 ; i++) BitSequence_temp[i] = 0x00;
    
-    // Remove end flag
-  for (int i = 0; i < k ; i++)
-   { 
-      if (BitSequence[i] == 0x01) cnt++;
-      else cnt = 0; // restart count at 1
-
-      if (cnt == 6) // there are five consecutive bits of the same value
-      {
-        k = i - 6;
-        break;
-      }
-    }
-
    //Bit unstuff : Remove 0 after five consecutive 1s.
    cnt = 0;
    s = 0;
@@ -312,8 +442,6 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
       {
           BitFound = true;
           cnt = 0; // and reset cnt to zero
-
-          // Serial.println("Zero removed");
       }
       BitSequence_temp[s++] = BitSequence[i]; // add the bit to the final sequence
     }
@@ -323,11 +451,9 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
     
     //Re-init ByteSequence
     for (int i=0; i < bytelength ; i++) ByteSequence[i] = 0x00; 
-
     //Convert bit to Byte
     k = 0;
-    // for (int i = 0; i < s - extraByte*8; i = i + 8)
-    for (int i = 0; i < s ; i = i + 8)
+    for (int i = 0; i < s - extraByte*8; i = i + 8)
       {
         temp = 0;
         if  (BitSequence_temp[i] == 0x01)   temp = temp + 0b10000000;
@@ -341,24 +467,27 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
         ByteSequence[k++] = temp;
       }
     
-   // radio.printBuffer("received:", ByteSequence, k);
+ //   Serial.println("Received Stream"); 
+ //   radio.printBuffer("received:", ByteSequence, k);
+    //for (int i=0 ; i < k; i++) Serial.print(ByteSequence[i],HEX);
+    Serial.println(""); 
     
     //Check if message has errors
     //Compute FCS on received byte stream
     FCS = 0;
-    FCS = crcCcitt(ByteSequence, k-2);
+    FCS = CRC_CCITT(ByteSequence, k-2);
     
     Checksum[1] = ByteSequence[k-2];
     Checksum[2] = ByteSequence[k-1];
     
-    // Serial.println("Checksums : ");
-    // Serial.println(Checksum[1],HEX);
-    // Serial.println(Checksum[2],HEX);
-    // Serial.println("FCS in LSB: ");
-    // Serial.print(FCS,HEX);
-    // Serial.println("Checksums computed: ");
-    // Serial.print((FCS >> 8) & 0xff,HEX);
-    // Serial.print(FCS & 0xff,HEX);
+    //Serial.println("Checksums : ");
+    //Serial.println(Checksum[1],HEX);
+    //Serial.println(Checksum[2],HEX);
+    //Serial.println("FCS in LSB: ");
+    //Serial.print(FCS,HEX);
+    //Serial.println("Checksums computed: ");
+    //Serial.print((FCS >> 8) & 0xff,HEX);
+    //Serial.print(FCS & 0xff,HEX);
     
     if (Checksum[1] != ((FCS >> 8) & 0xff))
     {
@@ -393,27 +522,26 @@ char* AX25::demod(byte *Buffer, uint8_t bytelength) {
     cnt++;
     //Recover message
     s = k-2-cnt;
-
-
-    // Serial.println("Final decoded Message");
-    // for (int i=0; i < s; i++) 
-    // {
-    //   Message[i] = char(ByteSequence_temp[cnt++]);
-    //   Serial.print(Message[i]);
-    // }
-    // Serial.println("");
-    return Message;
-    
+    Serial.println("Final decoded Message");
+    for (int i=0; i < s; i++) 
+    {
+      Message[i] = char(ByteSequence_temp[cnt++]);
+      Serial.print(Message[i]);
+    }
+    Serial.println("");
 }
 
-boolean AX25::logicXOR(boolean a, boolean b) {
+
+boolean logicXOR(boolean a, boolean b)
+{
   return (a||b) && !(a && b); 
 }
 
-uint16_t AX25::crcCcitt (byte *Buffer, uint8_t bytelength) {
+unsigned int CRC_CCITT (byte *Buffer, uint8_t bytelength)
+{
   uint8_t OutBit = 0;
-  uint16_t XORMask = 0x0000;
-  uint16_t SR = 0xFFFF;
+  unsigned int XORMask = 0x0000;
+  unsigned int SR = 0xFFFF;
   
   for (int i=0; i<bytelength ; i++)
   {
@@ -431,7 +559,8 @@ uint16_t AX25::crcCcitt (byte *Buffer, uint8_t bytelength) {
   return  MSB_LSB_swap_16bit(~SR);  
 }
 
-byte AX25::MSB_LSB_swap_8bit(byte v) {
+byte MSB_LSB_swap_8bit(byte v)
+{
   // swap odd and even bits
   v = ((v >> 1) & 0x55) | ((v & 0x55) << 1);
   // swap consecutive pairs
@@ -441,7 +570,8 @@ byte AX25::MSB_LSB_swap_8bit(byte v) {
   return v;
 }
 
-uint16_t AX25::MSB_LSB_swap_16bit(uint16_t v) {
+unsigned int MSB_LSB_swap_16bit(unsigned int v)
+{
   // swap odd and even bits
   v = ((v >> 1) & 0x5555) | ((v & 0x5555) << 1);
   // swap consecutive pairs
@@ -453,9 +583,5 @@ uint16_t AX25::MSB_LSB_swap_16bit(uint16_t v) {
   return v;
 }
 
-void AX25::arrayInit() {
-  // Populate arrays for message and final sequence with 0s
-  for (int i=0; i< MAX_LENGTH * 8 ;i++) bitSequence[i] = 0;
-  for (int i=0; i< MAX_LENGTH_FINAL ;i++) finalSequence[i] = 0;
-  for (int j=0; j< 256 ;j++) strcpy(message," ");
-}
+
+

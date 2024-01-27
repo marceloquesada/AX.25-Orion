@@ -1,6 +1,9 @@
 #ifndef AX25_h
 #define AX25_h
 
+#include <SPI.h>
+#include "RH_RF22.h"
+#include <RHGenericDriver.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -8,8 +11,8 @@
 
 //Magic Constants
 #define AX25_FLAG				0x7E
-//#define AX25_SSID_SOURCE		0x61
-//#define AX25_SSID_DESTINATION	0x60
+#define AX25_SSID_SOURCE		0x61
+#define AX25_SSID_DESTINATION	0x60
 #define AX25_CONTROL			0x03
 #define AX25_PROTOCOL			0xF0
 
@@ -24,31 +27,75 @@
 class AX25 {
 public:
 	//Default Constructor
-	// AX25(char* fromCallsign, char* fromSSID);
-	AX25(char *source_callsign, byte source_ssid);
+	// AX25(char* fromCallsign, char* toCallsign);
+	AX25(uint8_t slaveSelectPin = SS, uint8_t interruptPin = 2, uint8_t _shutdownPin = 9);
 
-	byte* modulatePacket(char* payload, uint16_t size); // void transmit(char* payload, unsigned int len)
-  void AX25::setDestination(char *dest_callsign, byte dest_ssid);
+	RH_RF22 radio;
+
+	bool powerAndInit();
+
+	void transmit(char* payload, uint16_t size); // void transmit(char* payload, unsigned int len)
+
+	bool available();
+
+	void setRxMode();
+
+	void setTxMode();
+
 	bool receive(uint8_t* buf, uint8_t* len);
+
 	char* demod(byte *Buffer, uint8_t bytelength);
 
-  byte finalSequence[MAX_LENGTH_FINAL];
+	uint8_t shutdownPin;
+
+	
+
+	// TODO: figure out
+	// inline void setFrequency(float freq);
+
+	// inline void setPower(byte pwr);
 
 private:
+
+	RH_RF22::ModemConfig FSK1k2 = {
+	    0x2B, //reg_1c
+	    0x03, //reg_1f
+	    0x41, //reg_20
+	    0x60, //reg_21
+	    0x27, //reg_22
+	    0x52, //reg_23
+	    0x00, //reg_24
+	    0x9F, //reg_25
+	    0x2C, //reg_2c - Only matters for OOK mode
+	    0x11, //reg_2d - Only matters for OOK mode
+	    0x2A, //reg_2e - Only matters for OOK mode
+	    0x80, //reg_58
+	    0x60, //reg_69
+	    0x09, //reg_6e
+	    0xD5, //reg_6f
+	    0x24, //reg_70
+	    0x22, //reg_71
+	    0x01  //reg_72
+	  }; 
+
+	
+
+	RHHardwareSPI spi;
+
 	char SrcCallsign[7];
 	char DestCallsign[7];
 
 	byte ssid_source;
 	byte ssid_destination;
 
-  //These are buffer unsigned char arrays
 	byte bitSequence[MAX_LENGTH*8];
-	char message_buffer[256];
+	byte finalSequence[MAX_LENGTH_FINAL];
+	char message[256];
 
-  // Index runs through the message as bits are being added to keep track of last bit position
 	int Index = 0;
-
 	unsigned int FCS = 0;
+
+	void radioSetup();
 
 	void setSSIDsource(byte ssid_src);
 	void setSSIDdest(byte ssid_dest);
@@ -59,6 +106,7 @@ private:
 
 	void bitProcessing(byte *Buffer, uint8_t bytelength);
 
+	
 
 	boolean logicXOR(boolean a, boolean b);
 
@@ -74,9 +122,15 @@ private:
 	// Initializes arrays with zeros
 	void arrayInit();
 
+	void setCallsignAndSsid();
+
 	//Perform bit stuffing on the input array (add an extra 0 after 5 sequential 1's)
 	// unsigned int bitStuff(char* out, char* in, unsigned int inLen);
 	void formatPacket(uint16_t size);
+
+	void sendPacket();	
+
+
 };
 
 #endif //AX25_h
